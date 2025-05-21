@@ -1,0 +1,13 @@
+[Unit]
+Description=Wifi Connection Manager
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/dyonak/wifi-connect/
+ExecStart=/home/dyonak/wifi-connect/wifivenv/bin/python3 /home/dyonak/wifi-connect/wificonnect.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
