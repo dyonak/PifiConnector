@@ -1,8 +1,12 @@
+#!/usr/bin/env python3
+
 import subprocess
 import time
 import threading
 import os
 import re
+import sys
+import requests # Add this at the top
 from flask import Flask, request, render_template_string, redirect, url_for, make_response
 
 # --- Configuration ---
@@ -114,10 +118,10 @@ def configure_route():
     if received_credentials_store is not None:
         received_credentials_store['ssid'] = ssid
         received_credentials_store['password'] = password
-
+    
     if credentials_received_event:
         credentials_received_event.set()
-
+        
     return render_template_string(HTML_CONNECTING_TEMPLATE, ap_ssid=flask_ap_ssid)
 
 @flask_app.route('/<path:path>')
@@ -127,7 +131,7 @@ def catch_all_route(path):
     if path == "generate_204" or path == "gen_204":
         print(f"Captive portal check: /{path} -> 204 No Content")
         return redirect(url_for("index_route"))
-
+    
     # iOS, Windows, Kindle etc.
     common_detection_strings = ["hotspot-detect.html", "success.html", "ncsi.txt", "check_network_status", "kindle-wifi/wifistub.html"]
     if any(detect_str in path for detect_str in common_detection_strings):
@@ -177,7 +181,7 @@ def get_wifi_interface_name():
                     WIFI_IFACE = line.split("Interface")[1].strip()
                     print(f"Auto-detected WiFi interface using 'iw dev': {WIFI_IFACE}")
                     return WIFI_IFACE
-
+        
         output = run_command(["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"], check=False)
         if output:
             for line in output.splitlines():
@@ -196,24 +200,65 @@ def get_wifi_interface_name():
 
 def check_internet_connection(iface):
     if not iface: return False
-    try:
-        status_output = run_command(["nmcli", "general", "status"], timeout=5)
-        if status_output and "connectivity: full" in status_output:
-            active_conns = run_command(["nmcli", "-t", "-f", "DEVICE,STATE", "connection", "show", "--active"], timeout=5)
-            if active_conns and f"{iface}:activated" in active_conns:
-                 print(f"Interface {iface} is active with full connectivity (NetworkManager).")
-                 return True
 
-        print("Attempting ping to 8.8.8.8 to verify internet.")
-        run_command(["ping", "-I", iface, "-c", "1", "-W", "3", "8.8.8.8"], check=True, timeout=5)
-        print("Ping successful. Internet connection verified.")
-        return True
+    # Attempt with nmcli first for overall system state
+    try:
+        status_output = run_command(["nmcli", "general", "status"], timeout=5, check=True)
+        if status_output and "connectivity: full" in status_output:
+            active_conns = run_command(["nmcli", "-t", "-f", "DEVICE,STATE", "connection", "show", "--active"], timeout=5, check=True)
+            if active_conns and f"{iface}:activated" in active_conns:
+                print(f"Interface {iface} is active with full connectivity (NetworkManager).")
+                return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        # print(f"Internet connection check failed for {iface}: {e}") # Error already printed by run_command
-        return False
+        print("NetworkManager reports no full connectivity or command failed.")
+        # Continue to more robust checks
     except Exception as e:
-        print(f"Error during internet connection check: {e}")
-        return False
+        print(f"Error during nmcli check: {e}")
+        # Continue to more robust checks
+
+    print("Attempting robust internet checks (ping and HTTP)...")
+
+    # Ping check
+    ping_success = False
+    for i in range(4):
+        time.sleep(5)
+        try:
+            # Try multiple targets
+            run_command(["ping", "-I", iface, "-c", "1", "-W", "2", "8.8.8.8"], check=True, timeout=3)
+            print("Ping to 8.8.8.8 successful.")
+            ping_success = True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            print("Ping to 8.8.8.8 failed. Trying 1.1.1.1...")
+            try:
+                run_command(["ping", "-I", iface, "-c", "1", "-W", "2", "1.1.1.1"], check=True, timeout=3)
+                print("Ping to 1.1.1.1 successful.")
+                ping_success = True
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                print("Ping to 1.1.1.1 also failed.")
+        
+
+    if not ping_success:
+        return False # Both pings failed, likely no network layer connectivity
+
+    try:
+        # Use a small timeout, verify=False for self-signed (though not ideal, can be useful for captive portals)
+        # You might want to use a site that is known to return 204 or a simple page to reduce data transfer
+        response = requests.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5)
+        if response.status_code == 204:
+            print("HTTP check to Google's connectivity endpoint successful (204 No Content). Internet confirmed.")
+            return True
+        else:
+            print(f"HTTP check to Google's connectivity endpoint returned status {response.status_code}. Not 204.")
+            # Could be a captive portal, or genuine issue. If 200, it's likely internet.
+            if response.status_code == 200:
+                print("Received 200 OK, assuming internet is available.")
+                return True
+
+    except requests.exceptions.RequestException as e:
+        print(f"HTTP check failed: {e}")
+        return False # HTTP check failed, could be captive portal or no internet
+
+    return False # Fallback if no checks passed
 
 dnsmasq_process = None # Global variable to hold the dnsmasq subprocess
 DNSMASQ_LOG_LINES = [] # Store recent dnsmasq log lines
@@ -248,7 +293,7 @@ def start_access_point_manual_ip(iface):
         print(f"Verifying IP address {AP_IP_ADDRESS} on interface {iface}...")
         ip_assigned_successfully = False
         # Check for up to 10 seconds for the IP to be assigned
-        for i in range(10):
+        for i in range(10): 
             # Use check=False as 'ip addr show' might return non-zero if IP not yet assigned or iface is briefly down
             # A short timeout for the command itself is also good.
             ip_output = run_command(["ip", "-4", "addr", "show", iface], check=False, timeout=3)
@@ -259,7 +304,7 @@ def start_access_point_manual_ip(iface):
             else:
                 print(f"Attempt {i+1}/10: IP address {AP_IP_ADDRESS} not yet found on {iface}. Waiting 1s...")
                 time.sleep(1)
-
+        
         if not ip_assigned_successfully:
             print(f"CRITICAL: Failed to confirm IP address {AP_IP_ADDRESS} on {iface} after AP activation. dnsmasq will likely fail.")
             return False # This will trigger cleanup and retry logic in main loop
@@ -275,7 +320,7 @@ def stop_access_point(iface):
     try:
         run_command(["nmcli", "connection", "down", AP_CONNECTION_NAME], check=False, timeout=10)
         run_command(["nmcli", "connection", "delete", AP_CONNECTION_NAME], check=False, timeout=10)
-
+        
         iptables_cmd_delete = ["sudo", "iptables", "-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "tcp", "--dport", "80", "-j", "DNAT", "--to-destination", f"{AP_IP_ADDRESS}:{FLASK_PORT}"]
         run_command(iptables_cmd_delete, check=False)
         print("Removed iptables port redirection rule (if it existed).")
@@ -297,9 +342,9 @@ def start_manual_dnsmasq(iface):
         print(f"Invalid AP_IP_ADDRESS format: {AP_IP_ADDRESS}")
         return False
     subnet_base = ".".join(ip_parts[:3]) + "."
-
+    
     # Try to stop potentially conflicting services
-    try:
+    try: 
         run_command(["sudo", "systemctl", "stop", "dnsmasq.service"], check=False)
     except Exception as e:
         print(f"Note: Could not stop system dnsmasq.service (may not be running or installed): {e}")
@@ -342,22 +387,22 @@ def start_manual_dnsmasq(iface):
         # unless we read it asynchronously or it crashes.
         # A simpler approach for now: if it crashes, its stderr will be available via communicate().
         dnsmasq_process = subprocess.Popen(dnsmasq_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True)
-
+        
         time.sleep(2) # Give dnsmasq a moment to start and potentially fail or log initial messages
 
         if dnsmasq_process.poll() is not None: # Check if it exited immediately
             print("CRITICAL: Manual dnsmasq process exited prematurely.")
             # Capture all output
-            stdout, stderr = dnsmasq_process.communicate(timeout=5)
-            if stdout:
+            stdout, stderr = dnsmasq_process.communicate(timeout=5) 
+            if stdout: 
                 print(f"dnsmasq stdout:\n{stdout}")
                 DNSMASQ_LOG_LINES.extend(stdout.splitlines())
-            if stderr:
+            if stderr: 
                 print(f"dnsmasq stderr (this should contain debug info):\n{stderr}")
                 DNSMASQ_LOG_LINES.extend(stderr.splitlines())
             dnsmasq_process = None
             return False
-
+        
         print("Manual dnsmasq process appears to be running. The -d flag means it will log verbosely to its stderr.")
         print("If captive portal issues persist, check system logs for dnsmasq or stop this script and run the dnsmasq command manually in a terminal to see live output.")
         return True
@@ -444,18 +489,18 @@ def connect_to_target_wifi(iface, ssid, password):
         time.sleep(2)
         run_command(["nmcli", "connection", "delete", ssid], check=False, timeout=10) # Delete by SSID
         time.sleep(1)
-
+        
         print(f"Connecting {iface} to SSID '{ssid}'...")
         cmd_connect = ["nmcli", "device", "wifi", "connect", ssid, "password", password, "ifname", iface]
         run_command(cmd_connect, timeout=45)
-
+        
         print("Waiting for connection to establish and verify internet (up to 30s)...")
         for _ in range(6):
             time.sleep(5)
             if check_internet_connection(iface):
                 print(f"Successfully connected to {ssid} and internet access verified.")
                 return True
-
+        
         print(f"Connected to {ssid} but failed to verify internet access after timeout.")
         run_command(["nmcli", "connection", "delete", ssid], check=False) # Clean up by SSID
         return False
@@ -482,10 +527,10 @@ def main():
     print(f"Captive Portal AP will be: SSID='{AP_SSID}', Password='{AP_PSK}'")
     print(f"Captive Portal Web UI will be at: http://{AP_IP_ADDRESS}:{FLASK_PORT}")
 
-    _credentials_store = {}
+    _credentials_store = {} 
     _credentials_event = threading.Event()
     init_flask_shared_data(_credentials_event, _credentials_store, AP_SSID)
-
+    
     flask_server_thread = None
 
     try:
@@ -496,7 +541,7 @@ def main():
                 continue
 
             print("No internet connection. Starting AP mode for WiFi configuration...")
-
+            
             _credentials_event.clear()
             _credentials_store.clear()
 
@@ -510,7 +555,7 @@ def main():
                     print(f"Added iptables rule: redirect port 80 on {current_wifi_iface} to {AP_IP_ADDRESS}:{FLASK_PORT}")
 
                     print(f"AP '{AP_SSID}' and manual dnsmasq started. Waiting for client...")
-
+                    
                     flask_server_thread = threading.Thread(
                         target=run_flask_app_threaded,
                         args=(AP_IP_ADDRESS, FLASK_PORT),
@@ -520,7 +565,7 @@ def main():
                     print(f"Captive portal web server running. Access at http://{AP_IP_ADDRESS}:{FLASK_PORT}")
 
                     credentials_received = _credentials_event.wait(timeout=600)
-
+                    
                     # Before stopping dnsmasq, if it's still running, let's try to grab recent stderr if any
                     if dnsmasq_process and dnsmasq_process.poll() is None:
                         # This is hard to do reliably without async I/O or threads for Popen's streams.
@@ -537,6 +582,8 @@ def main():
                         time.sleep(3)
                         if connect_to_target_wifi(current_wifi_iface, target_ssid, target_password):
                             print("Successfully connected to the new WiFi network!")
+                            run_command(["sudo", "systemctl", "stop", "wificonnect.service"])
+                            sys.exit(0) #
                         else:
                             print("Failed to connect to the new WiFi. Retrying AP mode.")
                             time.sleep(RETRY_INTERVAL_AFTER_FAIL)
@@ -555,7 +602,7 @@ def main():
                     time.sleep(RETRY_INTERVAL_AFTER_FAIL)
             else: # Failed to start AP (manual IP)
                 print("Failed to start AP (manual IP). Retrying after a delay...")
-                stop_access_point(current_wifi_iface)
+                stop_access_point(current_wifi_iface) 
                 time.sleep(RETRY_INTERVAL_AFTER_FAIL)
 
     except KeyboardInterrupt:
