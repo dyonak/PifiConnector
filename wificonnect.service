@@ -5,8 +5,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/albumplayer/PifiConnector/
-ExecStart=/home/albumplayer/PifiConnector/wifivenv/bin/python3 wificonnect.py
+WorkingDirectory=/home/USERNAME/PifiConnector/
+ExecStart=/home/USERNAME/PifiConnector/wifivenv/bin/python3 wificonnect.py
 Restart=on-failure
 
 [Install]
