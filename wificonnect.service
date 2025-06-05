@@ -5,9 +5,9 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/dyonak/wifi-connect/
-ExecStart=/home/dyonak/wifi-connect/wifivenv/bin/python3 /home/dyonak/wifi-connect/wificonnect.py
-Restart=always
+WorkingDirectory=/home/albumplayer/PifiConnector/
+ExecStart=/home/albumplayer/PifiConnector/wifivenv/bin/python3 wificonnect.py
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
