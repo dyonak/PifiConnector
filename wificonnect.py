@@ -481,13 +481,17 @@ def stop_manual_dnsmasq():
                     print(f"Found PID {pid} from {pid_file_path}. Attempting to kill...")
                     run_command(["sudo", "kill", pid], check=False) # SIGTERM
                     time.sleep(1)
-                    run_command(["sudo", "kill", "-0", pid], check=False) # Check if process still exists
-                    # If it still exists, SIGKILL
-                    if run_command(["pgrep", "-f", f"dnsmasq.*{get_wifi_interface_name()}"], check=False): # Re-check if any dnsmasq for iface exists
-                         print(f"dnsmasq (PID {pid}) did not terminate with SIGTERM, sending SIGKILL.")
-                         run_command(["sudo", "kill", "-9", pid], check=False)
+                    # Check if process still exists by trying to send signal 0
+                    # This will raise CalledProcessError if process doesn't exist, or succeed if it does.
+                    try:
+                        run_command(["sudo", "kill", "-0", pid], check=True)
+                        # If it still exists, SIGKILL
+                        print(f"dnsmasq (PID {pid}) did not terminate with SIGTERM, sending SIGKILL.")
+                        run_command(["sudo", "kill", "-9", pid], check=False)
+                    except subprocess.CalledProcessError:
+                        print(f"dnsmasq (PID {pid}) terminated successfully with SIGTERM.")
             else: # Fallback if PID file not found or empty
-                print("PID file for manual dnsmasq not found. Attempting general terminate/kill.")
+                print("PID file for manual dnsmasq not found. Attempting general terminate/kill via Popen object.")
                 dnsmasq_process.terminate()
                 dnsmasq_process.wait(timeout=3)
         except subprocess.TimeoutExpired:
@@ -523,29 +527,38 @@ def connect_to_target_wifi(iface, ssid, password):
     print(f"Attempting to connect to WiFi: {ssid}")
     if not iface: return False
     try:
+        # Disconnect from current network on the interface, if any
         run_command(["nmcli", "device", "disconnect", iface], check=False, timeout=10)
-        time.sleep(2)
-        run_command(["nmcli", "connection", "delete", ssid], check=False, timeout=10) # Delete by SSID
-        time.sleep(1)
+        time.sleep(1) 
+        # Do NOT delete existing connection profiles for the target SSID here.
+        # nmcli device wifi connect will use/update existing or create new.
         
         print(f"Connecting {iface} to SSID '{ssid}'...")
         cmd_connect = ["nmcli", "device", "wifi", "connect", ssid, "password", password, "ifname", iface]
         run_command(cmd_connect, timeout=45)
         
         print("Waiting for connection to establish and verify internet (up to 30s)...")
-        for _ in range(6):
+        for _ in range(6): # 6 attempts * 5 seconds = 30 seconds
             time.sleep(5)
             if check_internet_connection(iface):
                 print(f"Successfully connected to {ssid} and internet access verified.")
+                # Ensure the connection is set to autoconnect for future boots
+                # Assuming the connection name is the same as the SSID, which is typical for nmcli.
+                try:
+                    run_command(["nmcli", "connection", "modify", ssid, "connection.autoconnect", "yes"], check=True, timeout=10)
+                    print(f"Ensured WiFi profile '{ssid}' is set to auto-connect.")
+                except Exception as e_autoconnect:
+                    print(f"Warning: Could not set autoconnect for '{ssid}': {e_autoconnect}. Connection might not persist after reboot.")
                 return True
         
         print(f"Connected to {ssid} but failed to verify internet access after timeout.")
-        run_command(["nmcli", "connection", "delete", ssid], check=False) # Clean up by SSID
+        # Do NOT delete the connection profile on failure. Let NetworkManager manage it.
+        # The user might need to re-enter credentials if they were wrong, or the network might be temporarily down.
         return False
 
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"Failed to connect to {ssid} via nmcli.") # Error details already printed by run_command
-        run_command(["nmcli", "connection", "delete", ssid], check=False)
+        # Do NOT delete the connection profile on failure.
         return False
     except Exception as e:
         print(f"An unexpected error occurred while trying to connect to {ssid}: {e}")
@@ -570,9 +583,33 @@ def main():
     _credentials_event = threading.Event()
     init_flask_shared_data(_credentials_event, _credentials_store, AP_SSID)
 
+    # --- Initial check on script startup (especially after boot) ---
+    print("Script starting. Checking for existing internet connection...")
+    # Give NetworkManager some time to establish a connection on its own after boot
+    INITIAL_CHECK_ATTEMPTS = 6  # Try 6 times
+    INITIAL_CHECK_DELAY = 5     # Wait 5 seconds between attempts (total 30s)
+    initial_connection_established_on_boot = False
+
+    for i in range(INITIAL_CHECK_ATTEMPTS):
+        if check_internet_connection(current_wifi_iface):
+            print(f"Internet connection found on startup (attempt {i+1}). Monitoring...")
+            initial_connection_established_on_boot = True
+            break
+        if i < INITIAL_CHECK_ATTEMPTS - 1:
+            print(f"No internet on startup yet (attempt {i+1}). Waiting {INITIAL_CHECK_DELAY}s for NetworkManager to auto-connect...")
+            time.sleep(INITIAL_CHECK_DELAY)
+        else:
+            print("No internet connection found after initial checks on startup. Proceeding to AP mode if necessary.")
+
     try:
         while True:
-            if check_internet_connection(current_wifi_iface):
+            if initial_connection_established_on_boot:
+                # If connected during startup, go straight to monitoring for the first loop iteration.
+                print(f"Internet connection active on {current_wifi_iface} (established on boot). Monitoring...")
+                initial_connection_established_on_boot = False # Reset flag for subsequent checks
+                time.sleep(MONITOR_INTERVAL)
+                continue
+            elif check_internet_connection(current_wifi_iface):
                 print(f"Internet connection active on {current_wifi_iface}. Monitoring...")
                 time.sleep(MONITOR_INTERVAL)
                 continue
@@ -587,7 +624,7 @@ def main():
                     # Add iptables rule AFTER AP and dnsmasq are up
                     iptables_cmd_delete = ["sudo", "iptables", "-t", "nat", "-D", "PREROUTING", "-i", current_wifi_iface, "-p", "tcp", "--dport", "80", "-j", "DNAT", "--to-destination", f"{AP_IP_ADDRESS}:{FLASK_PORT}"]
                     iptables_cmd_add = ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-i", current_wifi_iface, "-p", "tcp", "--dport", "80", "-j", "DNAT", "--to-destination", f"{AP_IP_ADDRESS}:{FLASK_PORT}"]
-                    run_command(iptables_cmd_delete, check=False)
+                    run_command(iptables_cmd_delete, check=False) # Delete first to avoid duplicates
                     run_command(iptables_cmd_add)
                     print(f"Added iptables rule: redirect port 80 on {current_wifi_iface} to {AP_IP_ADDRESS}:{FLASK_PORT}")
 
@@ -597,52 +634,51 @@ def main():
                     flask_server_thread.start()
                     print(f"Captive portal web server running. Access at http://{AP_IP_ADDRESS}:{FLASK_PORT}")
 
-                    credentials_received = _credentials_event.wait(timeout=600)
+                    credentials_received = _credentials_event.wait(timeout=600) # Wait up to 10 minutes
                     
-                    # Before stopping dnsmasq, if it's still running, let's try to grab recent stderr if any
-                    if dnsmasq_process and dnsmasq_process.poll() is None:
-                        # This is hard to do reliably without async I/O or threads for Popen's streams.
-                        # The -d output is best viewed by running dnsmasq manually if issues persist.
-                        pass
-
                     stop_manual_dnsmasq() # Stop dnsmasq first
-                    stop_access_point(current_wifi_iface) # Then stop AP
+                    stop_access_point(current_wifi_iface) # Then stop AP (which also stops Flask)
 
                     if credentials_received and _credentials_store.get('ssid'):
                         print("Credentials received.")
                         target_ssid = _credentials_store['ssid']
                         target_password = _credentials_store['password']
-                        time.sleep(3)
+                        time.sleep(3) # Give interface time to settle after AP mode
                         if connect_to_target_wifi(current_wifi_iface, target_ssid, target_password):
                             print("Successfully connected to the new WiFi network!")
-                            run_command(["sudo", "systemctl", "stop", "wificonnect.service"])
-                            sys.exit(0) #
+                            # If the script is run as a service, stopping the service is a clean way to exit.
+                            # If run manually, sys.exit(0) is enough.
+                            try:
+                                run_command(["sudo", "systemctl", "stop", "wificonnect.service"], check=False)
+                                print("wificonnect.service stopped.")
+                            except Exception as e_svc:
+                                print(f"Note: Could not stop wificonnect.service (may not be running as a service): {e_svc}")
+                            sys.exit(0) 
                         else:
                             print("Failed to connect to the new WiFi. Retrying AP mode.")
                             time.sleep(RETRY_INTERVAL_AFTER_FAIL)
                     else:
                         if not credentials_received: print("Timed out waiting for credentials.")
-                        else: print("Credentials event set, but no credentials found.")
+                        else: print("Credentials event set, but no credentials found in store.")
                         print("Retrying AP mode after a delay.")
                         time.sleep(RETRY_INTERVAL_AFTER_FAIL)
                 else: # Failed to start manual dnsmasq
                     print("Failed to start manual dnsmasq. Stopping AP and retrying.")
-                    # Print any captured dnsmasq logs if it failed
                     if DNSMASQ_LOG_LINES:
                         print("Recent dnsmasq log lines during failed start attempt:")
                         for line in DNSMASQ_LOG_LINES: print(line)
-                    stop_access_point(current_wifi_iface)
+                    stop_access_point(current_wifi_iface) # This also stops Flask if it was started
                     time.sleep(RETRY_INTERVAL_AFTER_FAIL)
             else: # Failed to start AP (manual IP)
                 print("Failed to start AP (manual IP). Retrying after a delay...")
-                stop_access_point(current_wifi_iface) 
+                stop_access_point(current_wifi_iface) # This also stops Flask if it was started
                 time.sleep(RETRY_INTERVAL_AFTER_FAIL)
 
     except KeyboardInterrupt:
         print("\nScript interrupted by user. Cleaning up...")
     finally:
         print("Performing final cleanup...")
-        # Ensure Flask server is stopped in final cleanup
+        # Ensure Flask server is stopped in final cleanup (already handled in stop_access_point, but good for direct exits)
         if flask_server_thread and flask_server_thread.is_alive():
             print("Final cleanup: Stopping Flask server...")
             flask_server_thread.shutdown()
