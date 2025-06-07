@@ -201,64 +201,64 @@ def get_wifi_interface_name():
 def check_internet_connection(iface):
     if not iface: return False
 
-    # Attempt with nmcli first for overall system state
+    # Check NetworkManager's general status.
+    # "full" means link and IP are likely okay, but internet access is not guaranteed.
+    # "limited" or "none" often means no internet.
+    # We use this as an early indicator but will always proceed to more robust checks
+    # unless connectivity is clearly "none".
     try:
         status_output = run_command(["nmcli", "general", "status"], timeout=5, check=True)
-        if status_output and "connectivity: full" in status_output:
-            active_conns = run_command(["nmcli", "-t", "-f", "DEVICE,STATE", "connection", "show", "--active"], timeout=5, check=True)
-            if active_conns and f"{iface}:activated" in active_conns:
-                print(f"Interface {iface} is active with full connectivity (NetworkManager).")
-                return True
+        if status_output:
+            # Extract the first line which contains the connectivity state
+            first_line = status_output.splitlines()[0] if status_output.splitlines() else ""
+            print(f"NetworkManager general status: {first_line}")
+            if "connectivity: none" in first_line:
+                print("NetworkManager reports no connectivity. Internet check failed.")
+                return False
+            # If "full", "limited", or "portal", we still need to verify actual internet.
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        print("NetworkManager reports no full connectivity or command failed.")
-        # Continue to more robust checks
+        print("Could not get NetworkManager general status or command failed. Proceeding with ping/HTTP checks.")
     except Exception as e:
-        print(f"Error during nmcli check: {e}")
-        # Continue to more robust checks
+        print(f"Error during nmcli general status check: {e}. Proceeding with ping/HTTP checks.")
 
     print("Attempting robust internet checks (ping and HTTP)...")
 
     # Ping check
-    ping_success = False
-    for i in range(4):
-        time.sleep(5)
+    ping_targets = ["8.8.8.8", "1.1.1.1"] # Reliable public DNS servers
+    ping_successful_for_any_target = False
+    for target_ip in ping_targets:
         try:
-            # Try multiple targets
-            run_command(["ping", "-I", iface, "-c", "1", "-W", "2", "8.8.8.8"], check=True, timeout=3)
-            print("Ping to 8.8.8.8 successful.")
-            ping_success = True
+            # Send 1 ping packet, wait up to 2 seconds for a reply. Command timeout 3s.
+            run_command(["ping", "-I", iface, "-c", "1", "-W", "2", target_ip], check=True, timeout=3)
+            print(f"Ping to {target_ip} successful.")
+            ping_successful_for_any_target = True
+            break # Exit loop if one target is reachable
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            print("Ping to 8.8.8.8 failed. Trying 1.1.1.1...")
-            try:
-                run_command(["ping", "-I", iface, "-c", "1", "-W", "2", "1.1.1.1"], check=True, timeout=3)
-                print("Ping to 1.1.1.1 successful.")
-                ping_success = True
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                print("Ping to 1.1.1.1 also failed.")
-        
+            print(f"Ping to {target_ip} failed.")
+        except Exception as e: # Catch other potential errors like FileNotFoundError for ping
+            print(f"Unexpected error during ping to {target_ip}: {e}")
+            # Continue to next target or fail if this was the last one
 
-    if not ping_success:
-        return False # Both pings failed, likely no network layer connectivity
+    if not ping_successful_for_any_target:
+        print("All ping targets failed. Internet connection likely down.")
+        return False
 
+    # HTTP check (only if at least one ping was successful)
     try:
-        # Use a small timeout, verify=False for self-signed (though not ideal, can be useful for captive portals)
-        # You might want to use a site that is known to return 204 or a simple page to reduce data transfer
+        # Google's generate_204 is a standard check; it should return HTTP 204 No Content.
         response = requests.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5)
         if response.status_code == 204:
             print("HTTP check to Google's connectivity endpoint successful (204 No Content). Internet confirmed.")
             return True
         else:
-            print(f"HTTP check to Google's connectivity endpoint returned status {response.status_code}. Not 204.")
-            # Could be a captive portal, or genuine issue. If 200, it's likely internet.
-            if response.status_code == 200:
-                print("Received 200 OK, assuming internet is available.")
-                return True
-
+            print(f"HTTP check to Google's connectivity endpoint returned status {response.status_code} (expected 204). Internet not confirmed.")
+            return False
     except requests.exceptions.RequestException as e:
         print(f"HTTP check failed: {e}")
-        return False # HTTP check failed, could be captive portal or no internet
+        return False
 
-    return False # Fallback if no checks passed
+    # Should not be reached if logic above is correct, but as a fallback:
+    return False
 
 dnsmasq_process = None # Global variable to hold the dnsmasq subprocess
 DNSMASQ_LOG_LINES = [] # Store recent dnsmasq log lines
