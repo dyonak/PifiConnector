@@ -24,6 +24,9 @@ RETRY_INTERVAL_AFTER_FAIL = 10 # Seconds to wait before retrying AP mode or conn
 # --- Flask App ---
 flask_app = Flask(__name__)
 # Shared data between main thread and Flask thread
+# Module-level global for the Flask server thread instance
+flask_server_thread = None
+# Module-level globals for Flask app to communicate with main thread
 credentials_received_event = None
 received_credentials_store = {}
 flask_ap_ssid = AP_SSID # Used in connecting template
@@ -85,6 +88,31 @@ HTML_CONNECTING_TEMPLATE = """
 </body>
 </html>
 """
+# --- Werkzeug Server Thread ---
+from werkzeug.serving import make_server # Add this import
+
+class FlaskServerThread(threading.Thread):
+    def __init__(self, app, port, host='0.0.0.0'):
+        super().__init__()
+        self.app = app
+        # Using threaded=True for make_server allows it to handle multiple requests concurrently (good for robustness)
+        self.srv = make_server(host, port, self.app, threaded=True, processes=0) # processes=0 ensures it runs in the thread
+        self.daemon = True # Ensures thread exits when main program exits
+
+    def run(self):
+        print(f"Flask server (Werkzeug) starting on http://{self.srv.host}:{self.srv.port}")
+        try:
+            self.srv.serve_forever()
+        except Exception as e:
+            # This might catch errors if serve_forever itself crashes,
+            # though clean shutdown is via self.srv.shutdown()
+            print(f"Flask server (Werkzeug) encountered an error: {e}")
+
+    def shutdown(self):
+        print("Attempting to shut down Flask server (Werkzeug)...")
+        self.srv.shutdown() # Signal the Werkzeug server to stop
+        print("Flask server (Werkzeug) shutdown signal sent.")
+
 
 def init_flask_shared_data(event, creds_store, ap_ssid_for_template):
     """Initializes shared data for Flask app running in a thread."""
@@ -92,15 +120,6 @@ def init_flask_shared_data(event, creds_store, ap_ssid_for_template):
     credentials_received_event = event
     received_credentials_store = creds_store
     flask_ap_ssid = ap_ssid_for_template
-
-
-def run_flask_app_threaded(host_ip, port):
-    """Runs the Flask app. Designed to be called in a separate thread."""
-    try:
-        # Use '0.0.0.0' to listen on all available interfaces within the AP network
-        flask_app.run(host='0.0.0.0', port=port, debug=False)
-    except Exception as e:
-        print(f"Flask app failed: {e}")
 
 @flask_app.route('/')
 def index_route():
@@ -317,6 +336,18 @@ def start_access_point_manual_ip(iface):
 def stop_access_point(iface):
     print(f"Stopping AP '{AP_CONNECTION_NAME}'...")
     if not iface: return True
+
+    global flask_server_thread # Access the module-level global
+    if flask_server_thread and flask_server_thread.is_alive():
+        print("Stopping Flask captive portal server...")
+        flask_server_thread.shutdown()
+        flask_server_thread.join(timeout=5) # Wait for the thread to terminate
+        if flask_server_thread.is_alive():
+            print("Warning: Flask server thread did not stop after shutdown and join.")
+        else:
+            print("Flask server stopped.")
+        flask_server_thread = None # Clear the reference
+
     try:
         run_command(["nmcli", "connection", "down", AP_CONNECTION_NAME], check=False, timeout=10)
         run_command(["nmcli", "connection", "delete", AP_CONNECTION_NAME], check=False, timeout=10)
@@ -522,6 +553,7 @@ def connect_to_target_wifi(iface, ssid, password):
 
 # --- Main Application Logic ---
 def main():
+    global flask_server_thread # Declare usage of the module-level global
     if os.geteuid() != 0:
         print("This script needs to be run as root (sudo). Exiting.")
         return
@@ -537,8 +569,6 @@ def main():
     _credentials_store = {} 
     _credentials_event = threading.Event()
     init_flask_shared_data(_credentials_event, _credentials_store, AP_SSID)
-    
-    flask_server_thread = None
 
     try:
         while True:
@@ -561,13 +591,9 @@ def main():
                     run_command(iptables_cmd_add)
                     print(f"Added iptables rule: redirect port 80 on {current_wifi_iface} to {AP_IP_ADDRESS}:{FLASK_PORT}")
 
-                    print(f"AP '{AP_SSID}' and manual dnsmasq started. Waiting for client...")
-                    
-                    flask_server_thread = threading.Thread(
-                        target=run_flask_app_threaded,
-                        args=(AP_IP_ADDRESS, FLASK_PORT),
-                        daemon=True
-                    )
+                    print(f"AP '{AP_SSID}' and manual dnsmasq started. Starting captive portal web server...")
+                    # Use the new FlaskServerThread
+                    flask_server_thread = FlaskServerThread(flask_app, FLASK_PORT) # host='0.0.0.0' is default
                     flask_server_thread.start()
                     print(f"Captive portal web server running. Access at http://{AP_IP_ADDRESS}:{FLASK_PORT}")
 
@@ -616,6 +642,13 @@ def main():
         print("\nScript interrupted by user. Cleaning up...")
     finally:
         print("Performing final cleanup...")
+        # Ensure Flask server is stopped in final cleanup
+        if flask_server_thread and flask_server_thread.is_alive():
+            print("Final cleanup: Stopping Flask server...")
+            flask_server_thread.shutdown()
+            flask_server_thread.join(timeout=5) # Wait for it to stop
+        flask_server_thread = None # Clear reference
+
         stop_manual_dnsmasq()
         stop_access_point(current_wifi_iface) # current_wifi_iface might be None if detection failed early
         print("Cleanup complete. Exiting.")
