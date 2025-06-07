@@ -582,12 +582,44 @@ def main():
     print(f"Captive Portal AP will be: SSID='{AP_SSID}', Password='{AP_PSK}'")
     print(f"Captive Portal Web UI will be at: http://{AP_IP_ADDRESS}:{FLASK_PORT}")
 
+    # --- Initial Network Check and Grace Period ---
+    # Give NetworkManager a chance to connect to known networks on startup.
+    print("Performing initial check for existing internet connection...")
+    print(f"Ensuring WiFi radio is on and {current_wifi_iface} is managed by NetworkManager.")
+    try:
+        run_command(["nmcli", "radio", "wifi", "on"], check=False) # Ensure WiFi radio is on
+        run_command(["nmcli", "device", "set", current_wifi_iface, "managed", "yes"], check=False) # Ensure NM manages the iface
+        time.sleep(2) # Give NetworkManager a moment to process these settings
+        run_command(["nmcli", "device", "wifi", "rescan"], check=False) # Trigger a scan for networks
+        print(f"Initial scan triggered on {current_wifi_iface}. Waiting for potential auto-connection...")
+        time.sleep(3) # Allow scan to initiate properly
+    except Exception as e:
+        # These commands are best-effort at startup; script can continue if they have minor issues.
+        print(f"Warning: Error during initial interface setup for {current_wifi_iface}: {e}")
+
+    INITIAL_CONNECTION_WAIT_TOTAL = 45  # Total seconds to wait for an initial connection
+    INITIAL_CONNECTION_WAIT_INTERVAL = 5 # Seconds between checks
+    print(f"Waiting up to {INITIAL_CONNECTION_WAIT_TOTAL}s for NetworkManager to connect to a known WiFi network...")
+
+    initial_connection_established = False
+    for i in range(INITIAL_CONNECTION_WAIT_TOTAL // INITIAL_CONNECTION_WAIT_INTERVAL):
+        if check_internet_connection(current_wifi_iface):
+            print("Successfully connected to a known network with internet upon startup.")
+            initial_connection_established = True
+            break
+        print(f"Initial connection check ({i+1}/{INITIAL_CONNECTION_WAIT_TOTAL // INITIAL_CONNECTION_WAIT_INTERVAL}) failed. Waiting {INITIAL_CONNECTION_WAIT_INTERVAL}s...")
+        if i < (INITIAL_CONNECTION_WAIT_TOTAL // INITIAL_CONNECTION_WAIT_INTERVAL) - 1: # Don't sleep after the last check
+            time.sleep(INITIAL_CONNECTION_WAIT_INTERVAL)
+
+    if not initial_connection_established:
+        print(f"No internet connection established after {INITIAL_CONNECTION_WAIT_TOTAL}s grace period.")
+    # --- End of Initial Network Check ---
+
     _credentials_store = {} 
     _credentials_event = threading.Event()
     init_flask_shared_data(_credentials_event, _credentials_store, AP_SSID)
     
     flask_server_thread = None
-
     try:
         while True:
             if check_internet_connection(current_wifi_iface):
