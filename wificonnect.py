@@ -320,12 +320,19 @@ def stop_access_point(iface):
     try:
         run_command(["nmcli", "connection", "down", AP_CONNECTION_NAME], check=False, timeout=10)
         run_command(["nmcli", "connection", "delete", AP_CONNECTION_NAME], check=False, timeout=10)
-        
+
+        # Explicitly remove IP configuration from the interface
+        # This helps ensure NetworkManager can take over cleanly for other connections.
+        run_command(["sudo", "ip", "addr", "flush", "dev", iface], check=False)
+        print(f"Flushed IP addresses from {iface} to ensure it's clean for NetworkManager.")
+        time.sleep(1) # Brief pause after flush
+
         iptables_cmd_delete = ["sudo", "iptables", "-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "tcp", "--dport", "80", "-j", "DNAT", "--to-destination", f"{AP_IP_ADDRESS}:{FLASK_PORT}"]
         run_command(iptables_cmd_delete, check=False)
         print("Removed iptables port redirection rule (if it existed).")
 
         run_command(["nmcli", "device", "wifi", "rescan"], check=False)
+        print(f"Requested Wi-Fi rescan on {iface}.")
         return True
     except Exception as e:
         print(f"Error stopping AP: {e}")
