@@ -493,32 +493,76 @@ def stop_manual_dnsmasq():
 
 
 def connect_to_target_wifi(iface, ssid, password):
-    print(f"Attempting to connect to WiFi: {ssid}")
+    print(f"Attempting to configure and connect to WiFi: {ssid}")
     if not iface: return False
+
+    # Use a consistent connection name for the target WiFi.
+    # This makes it easier to manage (e.g., delete if exists, check status).
+    # Replace non-alphanumeric characters for a valid nmcli connection name.
+    connection_name = f"target-{re.sub(r'[^a-zA-Z0-9_-]', '_', ssid)}"
+    print(f"Using NetworkManager connection name: {connection_name}")
+
     try:
+        # Ensure the interface is managed and ready
+        run_command(["nmcli", "device", "set", iface, "managed", "yes"], check=False)
         run_command(["nmcli", "device", "disconnect", iface], check=False, timeout=10)
-        time.sleep(2)
-        run_command(["nmcli", "connection", "delete", ssid], check=False, timeout=10) # Delete by SSID
         time.sleep(1)
+
+        # Delete any existing connection with this name to ensure a clean slate
+        run_command(["nmcli", "connection", "delete", connection_name], check=False, timeout=10)
+        time.sleep(1)
+        # Also try deleting by the raw SSID in case an old profile exists from a previous version
+        # or manual setup where the SSID itself was used as the connection name.
+        run_command(["nmcli", "connection", "delete", ssid], check=False, timeout=10)
+        time.sleep(1)
+
+
+        print(f"Adding new connection profile '{connection_name}' for SSID '{ssid}' with autoconnect enabled...")
+        add_cmd = [
+            "nmcli", "connection", "add",
+            "type", "wifi",
+            "con-name", connection_name,
+            "ifname", iface,
+            "ssid", ssid,
+            "connection.autoconnect", "yes", # Explicitly enable autoconnect
+            "wifi-sec.key-mgmt", "wpa-psk" # Assuming WPA-PSK, common case
+        ]
+        if password: # Only add psk if password is provided
+            add_cmd.extend(["wifi-sec.psk", password])
+        # If open networks are a primary target, this part might need adjustment
+        # e.g. add_cmd.extend(["wifi-sec.key-mgmt", "none"]) if no password
+
+        run_command(add_cmd, timeout=15) # This creates the profile
+        time.sleep(1)
+
+        print(f"Attempting to activate connection '{connection_name}'...")
+        # Use 'nmcli connection up' which is more direct for existing profiles
+        run_command(["nmcli", "connection", "up", connection_name], timeout=45)
         
-        print(f"Connecting {iface} to SSID '{ssid}'...")
-        cmd_connect = ["nmcli", "device", "wifi", "connect", ssid, "password", password, "ifname", iface]
-        run_command(cmd_connect, timeout=45)
-        
-        print("Waiting for connection to establish and verify internet (up to 30s)...")
-        for _ in range(6):
+        print(f"Connection to '{ssid}' (profile '{connection_name}') initiated. Verifying internet access (up to 30s)...")
+        internet_verified = False
+        for i in range(6): # Check for 30 seconds (6 * 5s)
             time.sleep(5)
             if check_internet_connection(iface):
-                print(f"Successfully connected to {ssid} and internet access verified.")
-                return True
+                print(f"Successfully connected to '{ssid}' and internet access verified.")
+                internet_verified = True
+                break
+            print(f"Internet check {i+1}/6 for '{ssid}' failed. Retrying...")
         
-        print(f"Connected to {ssid} but failed to verify internet access after timeout.")
-        run_command(["nmcli", "connection", "delete", ssid], check=False) # Clean up by SSID
-        return False
+        if internet_verified:
+            return True # Profile is saved with autoconnect=yes, and internet is working now.
+        else:
+            print(f"Connected to '{ssid}' (profile '{connection_name}' is saved with autoconnect=yes), "
+                  "but failed to verify internet access after timeout.")
+            print("The WiFi profile has been saved. NetworkManager will attempt to use it on next boot or if the network becomes available.")
+            # We DO NOT delete the connection here. Let it persist.
+            return False # Return False to indicate immediate internet is not available.
 
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        print(f"Failed to connect to {ssid} via nmcli.") # Error details already printed by run_command
-        run_command(["nmcli", "connection", "delete", ssid], check=False)
+        print(f"Failed to add or activate connection for {ssid} via nmcli.")
+        # Even on failure here, if 'nmcli connection add' succeeded, the profile might exist.
+        # It's probably safer to leave it for NetworkManager to handle or for manual cleanup.
+        print(f"The connection profile '{connection_name}' may or may not have been saved. Check 'nmcli connection show'.")
         return False
     except Exception as e:
         print(f"An unexpected error occurred while trying to connect to {ssid}: {e}")
@@ -600,11 +644,13 @@ def main():
                         time.sleep(3) # Brief pause before attempting connection
                         if connect_to_target_wifi(current_wifi_iface, target_ssid, target_password):
                             print("Successfully connected to the new WiFi network!")
+                            # Internet is confirmed at this point by connect_to_target_wifi
                             run_command(["sudo", "systemctl", "stop", "wificonnect.service"], check=False)
                             sys.exit(0)
                         else:
-                            print("Failed to connect to the new WiFi. Retrying AP mode.")
-                            # Fall through to post AP mode check and retry logic
+                            print("Failed to connect to the new WiFi with immediate internet verification. "
+                                  "The profile is saved for future attempts. Retrying AP mode for now.")
+                            # Fall through to post AP mode check and retry logic, AP will be stopped before that.
                     else:
                         if not credentials_received: print("Timed out waiting for credentials.")
                         else: print("Credentials event set, but no credentials found (or SSID missing).")
