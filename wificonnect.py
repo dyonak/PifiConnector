@@ -318,14 +318,25 @@ def stop_access_point(iface):
     print(f"Stopping AP '{AP_CONNECTION_NAME}'...")
     if not iface: return True
     try:
+        # Explicitly disconnect the interface first to release it
+        print(f"Explicitly disconnecting interface {iface} before AP teardown.")
+        run_command(["nmcli", "device", "disconnect", iface], check=False, timeout=10)
+        time.sleep(1) # Give a moment for disconnect to take effect
+
         run_command(["nmcli", "connection", "down", AP_CONNECTION_NAME], check=False, timeout=10)
         run_command(["nmcli", "connection", "delete", AP_CONNECTION_NAME], check=False, timeout=10)
-        
+
         iptables_cmd_delete = ["sudo", "iptables", "-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", "tcp", "--dport", "80", "-j", "DNAT", "--to-destination", f"{AP_IP_ADDRESS}:{FLASK_PORT}"]
         run_command(iptables_cmd_delete, check=False)
         print("Removed iptables port redirection rule (if it existed).")
 
+        # Ensure interface is set to managed so NM can use it for client connections
+        print(f"Ensuring interface {iface} is managed by NetworkManager.")
+        run_command(["nmcli", "device", "set", iface, "managed", "yes"], check=False)
+        time.sleep(1) # Give a moment for the setting to apply
+
         run_command(["nmcli", "device", "wifi", "rescan"], check=False)
+        print(f"Rescan initiated on {iface}. NetworkManager will attempt to connect to known networks.")
         return True
     except Exception as e:
         print(f"Error stopping AP: {e}")
