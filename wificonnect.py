@@ -244,21 +244,33 @@ def check_internet_connection(iface):
         return False
 
     # HTTP check (only if at least one ping was successful)
-    try:
-        # Google's generate_204 is a standard check; it should return HTTP 204 No Content.
-        response = requests.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5)
-        if response.status_code == 204:
-            print("HTTP check to Google's connectivity endpoint successful (204 No Content). Internet confirmed.")
-            return True
-        else:
-            print(f"HTTP check to Google's connectivity endpoint returned status {response.status_code} (expected 204). Internet not confirmed.")
-            return False
-    except requests.exceptions.RequestException as e:
-        print(f"HTTP check failed: {e}")
-        return False
+    http_check_url = "http://connectivitycheck.gstatic.com/generate_204"
+    http_attempts = 3
+    http_delay_between_attempts = 10 # seconds
 
-    # Should not be reached if logic above is correct, but as a fallback:
-    return False
+    for attempt in range(http_attempts):
+        try:
+            # Google's generate_204 is a standard check; it should return HTTP 204 No Content.
+            response = requests.get(http_check_url, timeout=5)
+            if response.status_code == 204:
+                print(f"HTTP check to {http_check_url} successful (204 No Content) on attempt {attempt+1}. Internet confirmed.")
+                return True
+            else:
+                print(f"HTTP check to {http_check_url} (attempt {attempt+1}) returned status {response.status_code} (expected 204).")
+                # If this is the last attempt, loop will end, and function will return False below.
+        except requests.exceptions.RequestException as e:
+            print(f"HTTP check to {http_check_url} (attempt {attempt+1}) failed: {e}")
+            # If this is the last attempt, loop will end, and function will return False below.
+        
+        if attempt < http_attempts - 1:
+            print(f"Waiting {http_delay_between_attempts}s before retrying HTTP check...")
+            time.sleep(http_delay_between_attempts)
+        else: # Last attempt failed or resulted in unexpected status code
+            print("All HTTP check attempts failed or did not confirm connectivity. Internet not confirmed via HTTP.")
+            return False
+    
+    # Fallback, should ideally not be reached if the loop logic is correct and covers all cases.
+        return False
 
 dnsmasq_process = None # Global variable to hold the dnsmasq subprocess
 DNSMASQ_LOG_LINES = [] # Store recent dnsmasq log lines
@@ -705,8 +717,8 @@ def main():
                     # AP mode has ended (either by creds processing which failed, or timeout).
                     # Give NetworkManager a chance to reconnect to a known network.
                     print("AP mode ended. Checking for auto-reconnection to known networks for up to 30 seconds...")
-                    reconnection_wait_total = 30  # seconds
-                    reconnection_wait_interval = 5 # seconds
+                    reconnection_wait_total = 60  # seconds
+                    reconnection_wait_interval = 10 # seconds
                     reconnected_externally = False # Initialize for this check cycle
                     for i in range(reconnection_wait_total // reconnection_wait_interval):
                         print(f"Auto-reconnection check ({i+1}/{reconnection_wait_total // reconnection_wait_interval})...")
