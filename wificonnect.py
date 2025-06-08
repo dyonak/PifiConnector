@@ -208,15 +208,15 @@ def check_internet_connection(iface):
     # unless connectivity is clearly "none".
     try:
         status_output = run_command(["nmcli", "general", "status"], timeout=5, check=True)
-        if status_output:
-            # Extract the first line which contains the connectivity state
-            first_line = status_output.splitlines()[0] if status_output.splitlines() else ""
-            print(f"NetworkManager general status: {first_line}")
-            if "connectivity: none" in first_line:
-                print("NetworkManager reports no connectivity. Internet check failed.")
-                return False
-            # If "full", "limited", or "portal", we still need to verify actual internet.
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        # Log the status, but don't make a decision based on it yet.
+        # Ping and HTTP checks are more definitive.
+        if status_output and status_output.splitlines():
+            print(f"NetworkManager general status: {status_output.splitlines()[0]}")
+        else:
+            print("NetworkManager general status: No output or empty.")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e_nmcli:
+        # This can happen if NetworkManager is not fully ready or the command fails.
+        # It's not necessarily fatal for internet connectivity if the interface is otherwise configured.
         print("Could not get NetworkManager general status or command failed. Proceeding with ping/HTTP checks.")
     except Exception as e:
         print(f"Error during nmcli general status check: {e}. Proceeding with ping/HTTP checks.")
