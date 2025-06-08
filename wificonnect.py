@@ -592,7 +592,7 @@ def main():
         time.sleep(2) # Give NetworkManager a moment to process these settings
         run_command(["nmcli", "device", "wifi", "rescan"], check=False) # Trigger a scan for networks
         print(f"Initial scan triggered on {current_wifi_iface}. Waiting for potential auto-connection...")
-        time.sleep(3) # Allow scan to initiate properly
+        time.sleep(15) # Increased: Allow scan to initiate and potentially connect.
     except Exception as e:
         # These commands are best-effort at startup; script can continue if they have minor issues.
         print(f"Warning: Error during initial interface setup for {current_wifi_iface}: {e}")
@@ -619,18 +619,29 @@ def main():
     _credentials_event = threading.Event()
     init_flask_shared_data(_credentials_event, _credentials_store, AP_SSID)
     
+    # This state variable will determine if we are in 'monitoring' or 'AP setup' mode.
+    # It's initialized by the outcome of the startup grace period.
+    internet_is_up = initial_connection_established
     flask_server_thread = None
+
     try:
         while True:
-            if check_internet_connection(current_wifi_iface):
-                print(f"Internet connection active on {current_wifi_iface}. Monitoring...")
+            if internet_is_up:
+                # We believe internet is up, or was up at the last check.
+                # Monitor for MONITOR_INTERVAL, then re-check.
+                print(f"Internet connection active or assumed. Monitoring on {current_wifi_iface} for {MONITOR_INTERVAL}s...")
                 time.sleep(MONITOR_INTERVAL)
-                continue
-
-            # No internet connection found by the primary check.
-            # Attempt to start AP mode.
-            print("No internet connection detected. Starting AP mode for WiFi configuration...")
+                if check_internet_connection(current_wifi_iface):
+                    print("Internet connection confirmed. Continuing to monitor.")
+                    # internet_is_up remains True
+                    continue # Back to the start of the while loop, will enter this block again
+                else:
+                    print("Internet connection lost during monitoring. Will attempt to start AP mode.")
+                    internet_is_up = False
+                    # Fall through to AP mode logic below (as internet_is_up is now False)
             
+            # If internet_is_up is False (either from startup, or lost during monitoring)
+            print("No internet connection. Preparing to start AP mode...")
             _credentials_event.clear()
             _credentials_store.clear()
             ap_started_successfully = False
@@ -681,12 +692,14 @@ def main():
                             sys.exit(0)
                         else:
                             print("Failed to connect to the new WiFi with immediate internet verification. "
-                                  "The profile is saved for future attempts. Retrying AP mode for now.")
-                            # Fall through to post AP mode check and retry logic, AP will be stopped before that.
+                                  "The profile is saved. AP mode will restart after checks.")
+                            internet_is_up = False # Ensure state before POST AP MODE CHECK
+                            # Fall through to POST AP MODE CHECK
                     else:
                         if not credentials_received: print("Timed out waiting for credentials.")
                         else: print("Credentials event set, but no credentials found (or SSID missing).")
-                        # Fall through to post AP mode check and retry logic
+                        internet_is_up = False # Ensure state before POST AP MODE CHECK
+                        # Fall through to POST AP MODE CHECK
 
                     # --- POST AP MODE CHECK ---
                     # AP mode has ended (either by creds processing which failed, or timeout).
@@ -694,7 +707,7 @@ def main():
                     print("AP mode ended. Checking for auto-reconnection to known networks for up to 30 seconds...")
                     reconnection_wait_total = 30  # seconds
                     reconnection_wait_interval = 5 # seconds
-                    reconnected_externally = False
+                    reconnected_externally = False # Initialize for this check cycle
                     for i in range(reconnection_wait_total // reconnection_wait_interval):
                         print(f"Auto-reconnection check ({i+1}/{reconnection_wait_total // reconnection_wait_interval})...")
                         if check_internet_connection(current_wifi_iface):
@@ -706,12 +719,14 @@ def main():
                     
                     if reconnected_externally:
                         # Loop will restart, primary check_internet_connection at the top will pass.
-                        print("Proceeding to monitor mode.")
+                        print("Successfully reconnected. Proceeding to monitor mode.")
+                        internet_is_up = True # Set state for next main loop iteration
                         continue # Continue to the top of the main while loop
                     else:
                         print("Failed to auto-reconnect to a known network with internet after AP mode.")
                         print(f"Will retry AP mode after a delay of {RETRY_INTERVAL_AFTER_FAIL} seconds.")
-                        time.sleep(RETRY_INTERVAL_AFTER_FAIL)
+                        internet_is_up = False # Ensure state is correct
+                        time.sleep(RETRY_INTERVAL_AFTER_FAIL) 
                         continue # Continue to the top of the main while loop (which will likely re-enter AP)
 
                 else: # Failed to start manual dnsmasq
@@ -722,11 +737,13 @@ def main():
                         for line in DNSMASQ_LOG_LINES: print(line)
                     if ap_started_successfully: # Only stop AP if it was started
                         stop_access_point(current_wifi_iface)
+                    internet_is_up = False
                     time.sleep(RETRY_INTERVAL_AFTER_FAIL)
                     continue # Continue to the top of the main while loop
             else: # Failed to start AP (manual IP)
                 print("Failed to start AP (manual IP). Retrying after a delay...")
                 stop_access_point(current_wifi_iface) # Attempt cleanup just in case
+                internet_is_up = False
                 time.sleep(RETRY_INTERVAL_AFTER_FAIL)
                 continue # Continue to the top of the main while loop
 
