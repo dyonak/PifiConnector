@@ -637,6 +637,13 @@ def main():
 
     if not initial_connection_established:
         print(f"No internet connection established after {INITIAL_CONNECTION_WAIT_TOTAL}s grace period.")
+    else:
+        # Internet was found during the initial boot-up grace period.
+        # The script's primary job (getting initial connectivity) is done,
+        # or not needed because connectivity already exists. Stop the service.
+        print("Internet connection present on boot. Stopping wificonnect service as it's not needed.")
+        run_command(["sudo", "systemctl", "stop", "wificonnect.service"], check=False)
+        sys.exit(0)
     # --- End of Initial Network Check ---
 
     _credentials_store = {} 
