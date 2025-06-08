@@ -246,7 +246,7 @@ def check_internet_connection(iface):
     # HTTP check (only if at least one ping was successful)
     http_check_url = "http://connectivitycheck.gstatic.com/generate_204"
     http_attempts = 3
-    http_delay_between_attempts = 10 # seconds
+    http_delay_between_attempts = 3 # seconds
 
     for attempt in range(http_attempts):
         try:
@@ -271,6 +271,18 @@ def check_internet_connection(iface):
     
     # Fallback, should ideally not be reached if the loop logic is correct and covers all cases.
         return False
+
+def log_network_diagnostics(iface):
+    if not iface:
+        print("Cannot log network diagnostics: no interface provided.")
+        return
+    print(f"--- Network Diagnostics for {iface} at {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+    run_command(["nmcli", "device", "status"], check=False, timeout=5)
+    run_command(["nmcli", "-p", "connection", "show", "--active"], check=False, timeout=5) # -p for pretty
+    run_command(["ip", "addr", "show", "dev", iface], check=False, timeout=5)
+    run_command(["ip", "route", "show", "dev", iface], check=False, timeout=5) # Routes specific to iface
+    run_command(["ip", "route", "show", "default"], check=False, timeout=5)    # Default routes
+    print(f"--- End Network Diagnostics for {iface} ---")
 
 dnsmasq_process = None # Global variable to hold the dnsmasq subprocess
 DNSMASQ_LOG_LINES = [] # Store recent dnsmasq log lines
@@ -721,21 +733,32 @@ def main():
                     reconnection_wait_interval = 10 # seconds
                     reconnected_externally = False # Initialize for this check cycle
                     for i in range(reconnection_wait_total // reconnection_wait_interval):
-                        print(f"Auto-reconnection check ({i+1}/{reconnection_wait_total // reconnection_wait_interval})...")
+                        print(f"POST AP MODE: Auto-reconnection check ({i+1}/{reconnection_wait_total // reconnection_wait_interval})...")
+                        
+                        # Add a small initial delay before the first check in this loop,
+                        # on top of delays in stop_access_point()
+                        if i == 0:
+                            print("POST AP MODE: Giving NetworkManager a few seconds to establish connection after AP teardown...")
+                            time.sleep(5) # Initial grace for NM to connect
+
                         if check_internet_connection(current_wifi_iface):
-                            print("Successfully reconnected to a known network with internet.")
+                            print("POST AP MODE: Successfully reconnected to a known network with internet.")
                             reconnected_externally = True
                             break
+                        else: # Internet check failed
+                            print(f"POST AP MODE: Internet check failed on attempt {i+1}. Logging network state...")
+                            log_network_diagnostics(current_wifi_iface)
+
                         if i < (reconnection_wait_total // reconnection_wait_interval) - 1: # Don't sleep after last check
                              time.sleep(reconnection_wait_interval)
                     
                     if reconnected_externally:
                         # Loop will restart, primary check_internet_connection at the top will pass.
-                        print("Successfully reconnected. Proceeding to monitor mode.")
+                        print("POST AP MODE: Successfully reconnected. Proceeding to monitor mode.")
                         internet_is_up = True # Set state for next main loop iteration
                         continue # Continue to the top of the main while loop
                     else:
-                        print("Failed to auto-reconnect to a known network with internet after AP mode.")
+                        print("POST AP MODE: Failed to auto-reconnect to a known network with internet after AP mode timeout.")
                         print(f"Will retry AP mode after a delay of {RETRY_INTERVAL_AFTER_FAIL} seconds.")
                         internet_is_up = False # Ensure state is correct
                         time.sleep(RETRY_INTERVAL_AFTER_FAIL) 
